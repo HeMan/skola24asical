@@ -1,0 +1,5 @@
+ical
+fastapi
+uvicorn[standard]
+aiohttp
+pyparsing
