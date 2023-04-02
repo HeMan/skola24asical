@@ -1,38 +1,68 @@
 from datetime import datetime, time, timedelta
+from typing import Dict, NamedTuple
 
 import aiohttp
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from ical.calendar import Calendar
 from ical.calendar_stream import IcsCalendarStream
 from ical.event import Event
-from pydantic import BaseSettings
+from pydantic import BaseModel, BaseSettings
 
 
 class Settings(BaseSettings):
     header: dict = {"x-scope": "8a22163c-8662-4535-9050-bc5e1923df48"}
-    host: str = "ies.skola24.se"
-    unitguid: str = "MDQ5YTFlY2YtZDZkNi1mNTRhLWFjNWMtNGQ1NDhhZTk1ZDdh"
     keyurl: str = "https://web.skola24.se/api/get/timetable/render/key"
+    unitsurl: str = (
+        "https://web.skola24.se/api/services/skola24/get/timetable/viewer/units"
+    )
     scheduleurl: str = "https://web.skola24.se/api/render/timetable"
+    selectionurl: str = "https://web.skola24.se/api/get/timetable/selection"
+    classesfilter: Dict[str, bool] = {
+        "class": True,
+        "course": False,
+        "group": False,
+        "period": False,
+        "room": False,
+        "student": False,
+        "subject": False,
+        "teacher": False,
+    }
+
+
+class Domain(BaseModel):
+    domain: str
+
+
+class School(Domain):
+    unitguid: str
 
 
 settings = Settings()
 
 app = FastAPI()
 
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-#
-# TODO: argument for selection
-# TODO: argument for host
-# TODO: argument for unitguid
-# TODO: current date
+
+templates = Jinja2Templates(directory="templates")
 
 
 @app.get("/")
-async def read_root():
+async def get_root(request: Request):
+    return templates.TemplateResponse("main.html", {"request": request, "id": 200})
+
+
+@app.get("/ical/{host}/{unitguid}/{selection}")
+async def ical(host: str, unitguid: str, selection: str):
+    now = datetime.now()
+    weektoget = now - timedelta(days=now.weekday())
     key = await getkey()
-    schedule = await getschedule(key)
-    return Response(content=scheduletoical(schedule), media_type="text/calendar")
+    schedule = await getschedule(weektoget, key, host, unitguid, selection)
+    return Response(
+        content=scheduletoical(weektoget, schedule), media_type="text/calendar"
+    )
 
 
 async def getkey() -> str:
@@ -45,14 +75,50 @@ async def getkey() -> str:
             return ret["data"]["key"]
 
 
-async def getschedule(renderkey: str) -> list:
+@app.post("/getSchools/")
+async def getSchools(domain: Domain):
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            settings.unitsurl,
+            headers=settings.header,
+            json={"getTimetableViewerUnitsRequest": {"hostName": domain.domain}},
+        ) as resp:
+            schools = await resp.json()
+            return schools["data"]["getTimetableViewerUnitsResponse"]["units"]
+
+
+@app.post("/getClasses/")
+async def getClasses(school: School) -> list:
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            settings.selectionurl,
+            headers=settings.header,
+            json={
+                "hostName": school.domain,
+                "unitGuid": school.unitguid,
+                "filters": settings.classesfilter,
+            },
+        ) as response:
+            classes = await response.json()
+            if classes["error"]:
+                raise ValueError("Unknown unitGuid")
+            return classes["data"]["classes"]
+
+
+async def getschedule(
+    date: NamedTuple,
+    renderkey: str,
+    host: str,
+    unitguid: str,
+    selection: str,
+) -> list:
     payload = {
         "renderKey": renderkey,
-        "host": settings.host,
-        "unitGuid": settings.unitguid,
-        "selection": "MTQ0Mjk4ZDktYzg2My1mODQ4LTkxZmItYmI3YTAxOTQwMDkw",
-        "week": 40,
-        "year": 2022,
+        "host": host,
+        "unitGuid": unitguid,
+        "selection": selection,
+        "week": datetime.isocalendar(date).week,
+        "year": datetime.isocalendar(date).year,
         "width": 1,
         "height": 1,
     }
@@ -63,18 +129,14 @@ async def getschedule(renderkey: str) -> list:
             json=payload,
         ) as resp:
             timetable = await resp.json()
-            if timetable["validation"]:
-                print(timetable)
             return timetable["data"]["lessonInfo"]
 
 
-def scheduletoical(schedule: list):
-    d = "2022-W40"
-    dateforfirstday = datetime.strptime(d + "-1", "%G-W%V-%u")
+def scheduletoical(weektoget: NamedTuple, schedule: list):
     calendar = Calendar()
     for lesson in schedule:
         weekday = int(lesson["dayOfWeekNumber"]) - 1
-        curdate = dateforfirstday + timedelta(days=weekday)
+        curdate = weektoget + timedelta(days=weekday)
         timestart = time.fromisoformat(lesson["timeStart"])
         timeend = time.fromisoformat(lesson["timeEnd"])
         calendar.events.append(
